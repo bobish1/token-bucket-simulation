@@ -1,26 +1,3 @@
-"""
-Symulacja zdarzeniowa policera Token Bucket
-Sieci Wielousługowe -- projekt (Jan Gajownik, Mikita Zhydko)
-
-Założenia (zgodne ze schematem blokowym):
-  * Symulacja zdarzeniowa (discrete-event) z kalendarzem zdarzeń (kopiec, heapq).
-  * Trzy typy zdarzeń: przybycie pakietu, zmiana stanu źródła, koniec symulacji.
-    Po pobraniu najbliższego zdarzenia sterowanie idzie jedną z trzech "nóg".
-  * Źródło ON-OFF DETERMINISTYCZNE: stałe T_ON i T_OFF (bez losowania) -> przebieg
-    jest w pełni powtarzalny.
-  * STAŁA przepływność w stanie ON (CBR): pakiety o stałym rozmiarze k w stałym
-    odstępie  dt = k / C, gdzie C to przepływność szczytowa źródła w ON.
-  * Kolejne przybycie planowane jest NA POCZĄTKU obsługi przybycia -- niezależnie
-    od decyzji policera (przepuść/odrzuć), o ile mieści się w bieżącym oknie ON
-    (t + dt < t_OFF). Dzięki temu odrzucenie pakietu nie urywa łańcucha ruchu.
-  * Token bucket:  TB = min(BS, TB + R * (t - t_prev)); na starcie kubełek pełny.
-    Generator tokenów działa w sposób CIĄGŁY (również w czasie OFF).
-  * P_drop = N_drop / N_all * 100 %.
-
-Jednostki: spójnie w bitach i sekundach (BS, k w bitach; R, C w bit/s; czasy w s).
-Można równie dobrze liczyć w bajtach -- byle konsekwentnie.
-"""
-
 from __future__ import annotations
 
 import argparse
@@ -72,12 +49,7 @@ class Result:
         ]
         if p is not None:
             avg_in = p.C * p.T_ON / (p.T_ON + p.T_OFF)
-            # Dolne ograniczenie strat (kubełek "nieskończony" -> brak utraty tokenów):
-            #   w długim czasie nie da się przepuścić więcej niż R.
             p_lower = max(0.0, 1.0 - p.R / avg_in) * 100.0
-            # Oszacowanie stanu ustalonego z uwzględnieniem PRZEPEŁNIENIA kubełka w OFF:
-            #   poziom na początku okna ON  B0 = min(BS, R*T_OFF)  (kubełek opróżniony w ON),
-            #   tokeny dostępne w oknie ON  = B0 + R*T_ON,  ruch wejściowy = C*T_ON.
             B0 = min(p.BS, p.R * p.T_OFF)
             avail = B0 + p.R * p.T_ON
             inp = p.C * p.T_ON
@@ -156,7 +128,6 @@ class TokenBucketSim:
             else:                                     # noga 2
                 self._on_state_change(t)
 
-        # ---------- Generator raportu ----------
         P_drop = (self.N_drop / self.N_all * 100.0) if self.N_all else 0.0
         return Result(self.N_all, self.N_pass, self.N_drop, P_drop, log)
 
@@ -208,28 +179,33 @@ class TokenBucketSim:
 # --------------------------------------------------------------------------- #
 #  Narzędzie do badań: przemiatanie parametru
 # --------------------------------------------------------------------------- #
-def sweep(base: Params, param: str, values) -> list[tuple[float, float]]:
-    """Zwraca listę (wartość_parametru, P_drop[%]) dla zadanego zakresu wartości."""
+def sweep(base: Params, param: str, values, param2: str, values2) -> list[tuple[float, float]]:
+    """Zwraca listę (wartość_parametru, wartość_parametru2, P_drop[%]) dla zadanego zakresu wartości."""
     out = []
-    for v in values:
+    for v, v2 in zip(values, values2):
         kwargs = base.__dict__.copy()
         kwargs[param] = v
+        kwargs[param2] = v2
         res = TokenBucketSim(Params(**kwargs)).run()
-        out.append((v, res.P_drop))
+        out.append((v, v2, res.P_drop))
     return out
+
+def T_sim_for_T_ON_OFF(T_table: list[float], T_const: float) -> list[float]:
+    """Zwraca minimalny czas symulacji, aby objąć co najmniej 10 cykli ON-OFF."""
+    return [(T + T_const) * 10 for T in T_table]
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Symulacja policera Token Bucket dla źródła ON-OFF."
     )
-    parser.add_argument("--BS", type=float, default=50_000, help="Pojemność kubełka [bit]")
-    parser.add_argument("--R", type=float, default=4_000_000, help="Tempo napełniania tokenami [bit/s]")
+    parser.add_argument("--BS", type=float, default=100_000, help="Pojemność kubełka [bit]")
+    parser.add_argument("--R", type=float, default=5_000_000, help="Tempo napełniania tokenami [bit/s]")
     parser.add_argument("--k", type=float, default=1_000, help="Rozmiar pakietu [bit]")
     parser.add_argument("--C", type=float, default=10_000_000, help="Przepływność źródła w ON [bit/s]")
     parser.add_argument("--T-ON", dest="T_ON", type=float, default=0.1, help="Czas trwania fazy ON [s]")
     parser.add_argument("--T-OFF", dest="T_OFF", type=float, default=0.1, help="Czas trwania fazy OFF [s]")
-    parser.add_argument("--T-sim", dest="T_sim", type=float, default=1.0, help="Czas symulacji [s]")
+    parser.add_argument("--T-sim", dest="T_sim", type=float, default=2.0, help="Czas symulacji [s]")
     parser.add_argument("--start-OFF", dest="start_ON", action="store_false", help="Start źródła w stanie OFF")
     return parser.parse_args()
 
@@ -277,60 +253,44 @@ if __name__ == "__main__":
     res = TokenBucketSim(p, record=True).run()
     print(res.summary(p))
 
-    # --- przykładowe badanie: P_drop w funkcji R (tempa tokenów) ---
-    Rs = [1e6, 2e6, 3e6, 4e6, 5e6, 6e6, 7e6, 8e6, 9e6, 10e6]
-    data = sweep(p, "R", Rs)
-    print("\nP_drop(R):")
-    for R, pd in data:
-        print(f"  R = {R/1e6:5.1f} Mbit/s  ->  P_drop = {pd:6.2f} %")
+    T_OFF_s = [0.1, 0.05, 0.025, 0.02, 0.015, 0.01, 0.005]
+    T_ON_s = [0.1, 0.15, 0.2, 0.25, 0.3, 0.5, 0.75]
+    T_sim1_s = [(T_ON + p.T_OFF) * 10 for T_ON in T_ON_s]
+    T_sim2_s = [(p.T_ON + T_OFF) * 10 for T_OFF in T_OFF_s]
 
-    # --- przykładowe badanie: P_drop w funkcji C (przepływności źródła) ---
-    Cs = [2e6, 4e6, 6e6, 8e6, 10e6, 12e6, 14e6, 16e6, 18e6, 20e6]
-    data_c = sweep(p, "C", Cs)
-    print("\nP_drop(C):")
-    for C, pd in data_c:
-        print(f"  C = {C/1e6:5.1f} Mbit/s  ->  P_drop = {pd:6.2f} %")
+    data_on = sweep(p, "T_ON", T_ON_s, "T_sim", T_sim1_s)
+    print("\nP_drop(T_ON):")
+    for T_ON, T_sim, pd in data_on:
+        print(f"  T_ON = {T_ON:.3f} s ->  P_drop = {pd:6.2f} %")
 
-    # --- przykładowe badanie: P_drop w funkcji BS (pojemności kubełka) ---
-    BSs = [10_000, 20_000, 30_000, 40_000, 50_000, 60_000, 80_000, 100_000, 150_000, 200_000]
-    data_bs = sweep(p, "BS", BSs)
-    print("\nP_drop(BS):")
-    for BS, pd in data_bs:
-        print(f"  BS = {BS/1e3:6.1f} kbit  ->  P_drop = {pd:6.2f} %")
+    
+    data_off = sweep(p, "T_OFF", T_OFF_s, "T_sim", T_sim2_s)
+    print("\nP_drop(T_OFF):")
+    for T_OFF, T_sim, pd in data_off:
+        print(f"  T_OFF = {T_OFF:.3f} s ->  P_drop = {pd:6.2f} %")
 
     # Wykres (jeśli dostępny matplotlib)
     try:
-        xs = [R / 1e6 for R, _ in data]
-        ys = [pd for _, pd in data]
+        xs = [T_ON for T_ON, _, _ in data_on]
+        ys = [pd for _, _, pd in data_on]
         save_plot(
             xs,
             ys,
-            "R  [Mbit/s]",
-            "P_drop w funkcji tempa tokenów R",
-            "pdrop_vs_R.png",
-            vline=p.C * p.T_ON / (p.T_ON + p.T_OFF) / 1e6,
-            vline_label="śr. przepływność wejściowa",
+            "T_ON  [s]",
+            "P_drop w funkcji zmiany czasu trwania fazy ON",
+            "pdrop_vs_T_ON.png",
         )
 
-        xs_c = [C / 1e6 for C, _ in data_c]
-        ys_c = [pd for _, pd in data_c]
+        xs_c = [T_OFF for T_OFF, _, _ in data_off]
+        ys_c = [pd for _, _, pd in data_off]
         save_plot(
             xs_c,
             ys_c,
-            "C  [Mbit/s]",
-            "P_drop w funkcji przepływności źródła C",
-            "pdrop_vs_C.png",
+            "T_OFF  [s]",
+            "P_drop w funkcji zmiany czasu trwania fazy OFF",
+            "pdrop_vs_T_OFF.png",
         )
 
-        xs_bs = [BS / 1e3 for BS, _ in data_bs]
-        ys_bs = [pd for _, pd in data_bs]
-        save_plot(
-            xs_bs,
-            ys_bs,
-            "BS  [kbit]",
-            "P_drop w funkcji pojemności kubełka BS",
-            "pdrop_vs_BS.png",
-        )
-        print("\nZapisano wykresy: pdrop_vs_R.png, pdrop_vs_C.png, pdrop_vs_BS.png")
+        print("\nZapisano wykresy: pdrop_vs_T_ON.png, pdrop_vs_T_OFF.png")
     except Exception as e:
         print(f"\n(pominięto wykres: {e})")
